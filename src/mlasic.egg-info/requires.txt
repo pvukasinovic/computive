@@ -1,0 +1,7 @@
+onnx>=1.14
+onnxruntime>=1.16
+numpy>=1.24
+
+[dev]
+pytest>=7.0
+ruff>=0.1

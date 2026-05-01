@@ -1,0 +1,15 @@
+pyproject.toml
+src/mlasic/__init__.py
+src/mlasic/exceptions.py
+src/mlasic/export.py
+src/mlasic/ingestion.py
+src/mlasic/ir.py
+src/mlasic.egg-info/PKG-INFO
+src/mlasic.egg-info/SOURCES.txt
+src/mlasic.egg-info/dependency_links.txt
+src/mlasic.egg-info/requires.txt
+src/mlasic.egg-info/top_level.txt
+tests/test_export.py
+tests/test_ingestion.py
+tests/test_ir.py
+tests/test_roundtrip.py

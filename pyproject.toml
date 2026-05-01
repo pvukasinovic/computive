@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlasic"
+version = "0.1.0"
+description = "ML model to ASIC compiler — ONNX to synthesizable Verilog"
+requires-python = ">=3.10"
+dependencies = [
+    "onnx>=1.14",
+    "onnxruntime>=1.16",
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[project.scripts]
+mlasic = "mlasic.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "real_model: tests requiring the real MLPerf AD model file",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
