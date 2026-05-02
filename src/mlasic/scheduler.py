@@ -5,6 +5,13 @@ assignments to a quantized IR graph. Produces a Schedule object and
 optional schedule.json for downstream stages.
 
 RTL spec (corrected §6.4) is authoritative for cycle formulas.
+
+Activation bank assignment is liveness-driven: a `BankAllocator` walks
+the graph, tracks which physical bank holds which tensor, and picks an
+output bank that is free at the moment the layer fires. For a strict
+linear chain this collapses to the historical A/B ping-pong pattern; for
+graphs with still-live producers it surfaces a SRAM conflict instead of
+silently corrupting a live tensor.
 """
 
 from __future__ import annotations
@@ -53,6 +60,131 @@ class CycleBreakdown:
 
 
 # ---------------------------------------------------------------------------
+# BankAllocator — liveness-driven activation bank assignment
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _BankState:
+    """Tracks which tensor currently occupies a bank and how many consumers remain."""
+
+    tensor: Optional[str] = None
+    remaining_uses: int = 0
+
+
+class BankAllocator:
+    """Liveness-driven allocator for the two-bank activation SRAM.
+
+    The accelerator has exactly two activation banks (A, B). For each
+    layer in execution order, this allocator:
+      1. Reads the input bank from the bank currently holding the layer's
+         input tensor (the first layer's input is loaded into bank ``A``
+         by AXI convention).
+      2. Decrements the remaining-use counter for that input tensor; if
+         it falls to zero, the bank is freed.
+      3. Picks an output bank that is currently free (or about to be
+         freed by this layer's input consumption). If both banks still
+         hold live tensors, raises ``BankConflict``.
+
+    For a strict linear chain (which is what the v0.1 RTL supports) this
+    produces the canonical A/B alternation. For any DAG with a
+    still-live skip activation we refuse to silently overwrite it.
+    """
+
+    INPUT_BANK = "A"
+    BANKS = ("A", "B")
+
+    class BankConflict(RuntimeError):
+        """Raised when no free bank is available for a layer's output."""
+
+    def __init__(self, graph: Graph):
+        self.graph = graph
+        graph._build_adjacency()
+        self._consumer_count = self._count_consumers(graph)
+        self._state: dict[str, _BankState] = {b: _BankState() for b in self.BANKS}
+        # External graph input is staged into bank A by the AXI front-end.
+        for tname in graph.inputs:
+            self._state[self.INPUT_BANK] = _BankState(
+                tensor=tname,
+                remaining_uses=self._consumer_count.get(tname, 1),
+            )
+            break
+
+    @staticmethod
+    def _count_consumers(graph: Graph) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for node in graph.nodes.values():
+            for inp in node.inputs:
+                counts[inp] = counts.get(inp, 0) + 1
+        # A graph output that no node consumes still has at least one
+        # virtual reader (the AXI egress path), so reserve one use.
+        for out_name in graph.outputs:
+            counts.setdefault(out_name, 1)
+        return counts
+
+    def assign(self, node) -> tuple[str, str]:
+        """Return ``(in_bank, out_bank)`` for ``node`` and update state."""
+        in_tensor = self._activation_input_of(node)
+        out_tensor = node.outputs[0] if node.outputs else f"{node.name}/out"
+
+        in_bank = self._find_bank(in_tensor)
+        if in_bank is None:
+            raise self.BankConflict(
+                f"Node '{node.name}': input tensor '{in_tensor}' is not resident "
+                f"in any activation bank. Bank state: "
+                f"A={self._state['A'].tensor!r}, B={self._state['B'].tensor!r}"
+            )
+
+        # Consume one use of the input tensor.
+        in_state = self._state[in_bank]
+        in_state.remaining_uses -= 1
+        if in_state.remaining_uses <= 0:
+            self._state[in_bank] = _BankState()
+
+        # Pick an output bank that is currently free, preferring the
+        # bank that is *not* the input bank so the layer can read and
+        # write concurrently from physically separate SRAMs.
+        out_bank = self._pick_free_bank(prefer_other_than=in_bank)
+        if out_bank is None:
+            other = "B" if in_bank == "A" else "A"
+            raise self.BankConflict(
+                f"Node '{node.name}': cannot place output. "
+                f"Other bank ({other}) still holds live tensor "
+                f"{self._state[other].tensor!r}. The v0.1 two-bank "
+                f"hardware cannot schedule this DAG; promote to the "
+                f"tile fabric backend."
+            )
+
+        out_uses = self._consumer_count.get(out_tensor, 1)
+        self._state[out_bank] = _BankState(tensor=out_tensor, remaining_uses=out_uses)
+        return in_bank, out_bank
+
+    def _activation_input_of(self, node) -> str:
+        """The first non-constant, in-graph tensor input is the activation."""
+        for inp in node.inputs:
+            t = self.graph.tensors.get(inp)
+            if t is None or t.is_constant:
+                continue
+            return inp
+        # Fall back to the first input — caller will surface a clear error.
+        return node.inputs[0] if node.inputs else ""
+
+    def _find_bank(self, tensor: str) -> Optional[str]:
+        for bank, state in self._state.items():
+            if state.tensor == tensor:
+                return bank
+        return None
+
+    def _pick_free_bank(self, prefer_other_than: str) -> Optional[str]:
+        other = "B" if prefer_other_than == "A" else "A"
+        if self._state[other].tensor is None:
+            return other
+        if self._state[prefer_other_than].tensor is None:
+            return prefer_other_than
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Scheduler
 # ---------------------------------------------------------------------------
 
@@ -89,6 +221,8 @@ class Scheduler:
         ordered_names = graph.topological_order()
         ordered_nodes = [graph.nodes[n] for n in ordered_names]
 
+        bank_allocator = BankAllocator(graph)
+
         layer_schedules: list[LayerSchedule] = []
         current_cycle = 0
         weight_row_cursor = 0
@@ -113,9 +247,11 @@ class Scheduler:
             bias_rows = math.ceil(output_dim / self.constraints.biases_per_row)
             bias_bytes = bias_rows * self.constraints.biases_per_row * 4  # INT32
 
-            # Activation ping-pong: layer_idx[0] selects input bank
-            act_in_bank = "A" if idx % 2 == 0 else "B"
-            act_out_bank = "B" if idx % 2 == 0 else "A"
+            # Activation banks are picked by liveness analysis, not by
+            # layer index parity. For a strict linear chain this matches
+            # the historical A/B alternation; DAGs that would clobber a
+            # still-live tensor raise a clear conflict.
+            act_in_bank, act_out_bank = bank_allocator.assign(node)
 
             ls = LayerSchedule(
                 layer_index=idx,

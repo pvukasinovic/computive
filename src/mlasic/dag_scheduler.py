@@ -720,6 +720,118 @@ class DAGSchedule:
 
 
 # ---------------------------------------------------------------------------
+# Peak-SRAM-aware topological reorder
+# ---------------------------------------------------------------------------
+
+
+def _tensor_live_bytes(graph: Graph, tensor_name: str) -> int:
+    """Live activation bytes for a tensor; 0 for constants/unknown shapes."""
+    t = graph.tensors.get(tensor_name)
+    if t is None or t.is_constant:
+        return 0
+    if t.type.is_shape_known:
+        return t.type.size_bytes
+    return _safe_numel(t.type.shape) * t.type.dtype.itemsize
+
+
+def peak_aware_topological_order(graph: Graph) -> list[str]:
+    """Topological order that greedily minimises peak activation bytes.
+
+    Standard topo order is correctness-only. For a branchy DAG, two
+    distinct topo orders can produce wildly different peak SRAM. This
+    function uses a Sethi–Ullman-style greedy: among nodes whose
+    in-degree is zero, pick the one whose execution would *increase*
+    live activation bytes the least (output bytes minus bytes freed by
+    consuming the last use of an input).
+
+    For a strict linear chain this is identical to the canonical topo
+    order — only one node is ready at each step. The reorder kicks in
+    for residual blocks, parallel branches, and concat patterns where
+    deep branches should run after shallow ones to keep peak SRAM low.
+    """
+    graph._build_adjacency()
+
+    canonical_order = graph.topological_order()
+    canonical_idx = {n: i for i, n in enumerate(canonical_order)}
+
+    in_deg: dict[str, int] = {n: 0 for n in graph.nodes}
+    for node_name, node in graph.nodes.items():
+        for inp in node.inputs:
+            prod = graph._tensor_to_producer.get(inp)
+            if prod and prod in graph.nodes:
+                in_deg[node_name] += 1
+
+    consumers_remaining: dict[str, int] = {}
+    for tname in graph.tensors:
+        consumers_remaining[tname] = len(graph._tensor_to_consumers.get(tname, []))
+
+    ready: list[str] = [n for n, d in in_deg.items() if d == 0]
+    order: list[str] = []
+
+    def cost(name: str) -> tuple:
+        node = graph.nodes[name]
+        out_bytes = sum(_tensor_live_bytes(graph, t) for t in node.outputs)
+        freed = 0
+        for inp in node.inputs:
+            if consumers_remaining.get(inp, 0) == 1:
+                freed += _tensor_live_bytes(graph, inp)
+        # delta = bytes added; tiebreak by canonical topo position
+        # for determinism across runs.
+        return (out_bytes - freed, canonical_idx.get(name, 0))
+
+    while ready:
+        ready.sort(key=cost)
+        chosen = ready.pop(0)
+        order.append(chosen)
+        node = graph.nodes[chosen]
+        for inp in node.inputs:
+            if inp in consumers_remaining:
+                consumers_remaining[inp] = max(0, consumers_remaining[inp] - 1)
+        for out in node.outputs:
+            for cname in graph._tensor_to_consumers.get(out, []):
+                if cname not in graph.nodes:
+                    continue
+                in_deg[cname] -= 1
+                if in_deg[cname] == 0:
+                    ready.append(cname)
+
+    if len(order) != len(graph.nodes):
+        raise ValueError(
+            f"Cycle detected during peak-aware reorder: "
+            f"{len(order)}/{len(graph.nodes)} nodes scheduled"
+        )
+    return order
+
+
+def estimate_peak_bytes(graph: Graph, order: list[str]) -> int:
+    """Simulate live-byte usage along ``order``; returns peak."""
+    graph._build_adjacency()
+    consumers_remaining: dict[str, int] = {}
+    for tname in graph.tensors:
+        consumers_remaining[tname] = len(graph._tensor_to_consumers.get(tname, []))
+
+    live: set[str] = set()
+    live_bytes = 0
+    peak = 0
+    for name in order:
+        node = graph.nodes[name]
+        for out in node.outputs:
+            sz = _tensor_live_bytes(graph, out)
+            if sz > 0:
+                live.add(out)
+                live_bytes += sz
+        peak = max(peak, live_bytes)
+        for inp in node.inputs:
+            if inp not in consumers_remaining:
+                continue
+            consumers_remaining[inp] -= 1
+            if consumers_remaining[inp] <= 0 and inp in live:
+                live.remove(inp)
+                live_bytes -= _tensor_live_bytes(graph, inp)
+    return peak
+
+
+# ---------------------------------------------------------------------------
 # DAGScheduler (Step 5)
 # ---------------------------------------------------------------------------
 
@@ -738,9 +850,11 @@ class DAGScheduler:
         self,
         constraints: Optional[HardwareConstraints] = None,
         sram_budget_bytes: Optional[int] = None,
+        peak_aware_order: bool = True,
     ):
         self.constraints = constraints or HardwareConstraints()
         self.sram_budget_bytes = sram_budget_bytes
+        self.peak_aware_order = peak_aware_order
 
     def schedule(self, graph: Graph) -> DAGSchedule:
         """Schedule the graph. Returns DAGSchedule and mutates graph in place.
@@ -754,7 +868,10 @@ class DAGScheduler:
         """
         self._validate_preconditions(graph)
 
-        execution_order = graph.topological_order()
+        if self.peak_aware_order:
+            execution_order = peak_aware_topological_order(graph)
+        else:
+            execution_order = graph.topological_order()
         node_schedules: list[DAGLayerSchedule] = []
         node_end_cycles: dict[str, int] = {}
         current_cycle = 0

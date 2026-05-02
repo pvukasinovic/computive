@@ -1,0 +1,62 @@
+{
+  "total": 11,
+  "hit": 6,
+  "coverage_pct": 54.54545454545454,
+  "items": [
+    {
+      "name": "layer_execution",
+      "description": "All layers executed sequentially (6.5.1)",
+      "hit": false
+    },
+    {
+      "name": "weight_sram_read",
+      "description": "All weight SRAM banks read (6.5.2)",
+      "hit": false
+    },
+    {
+      "name": "ping_pong_swap",
+      "description": "Ping-pong buffer swap at layer boundary (6.5.3)",
+      "hit": true
+    },
+    {
+      "name": "axi_backpressure",
+      "description": "AXI-Stream backpressure exercised (6.5.4)",
+      "hit": true
+    },
+    {
+      "name": "csr_read_write",
+      "description": "AXI-Lite register read/write all offsets (6.5.5)",
+      "hit": true
+    },
+    {
+      "name": "irq_done",
+      "description": "IRQ_DONE interrupt fires on completion (6.5.6)",
+      "hit": true
+    },
+    {
+      "name": "irq_error",
+      "description": "Error interrupt path tested (6.5.7)",
+      "hit": false
+    },
+    {
+      "name": "back_to_back",
+      "description": "Back-to-back inferences correct (6.5.8)",
+      "hit": false
+    },
+    {
+      "name": "output_tiling",
+      "description": "Output tiling works for multi-tile layers (6.5.9)",
+      "hit": false
+    },
+    {
+      "name": "relu_activation",
+      "description": "ReLU activates on positive, clamps on negative (6.5.10)",
+      "hit": true
+    },
+    {
+      "name": "requant_boundary",
+      "description": "Requantization handles boundary values (6.5.11)",
+      "hit": true
+    }
+  ]
+}

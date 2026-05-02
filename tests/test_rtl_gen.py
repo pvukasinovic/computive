@@ -339,7 +339,7 @@ class TestAcceleratorTop:
         """accelerator_top.sv has interrupt output."""
         output_dir, _ = generated_rtl
         content = (output_dir / "accelerator_top.sv").read_text()
-        assert "output logic        irq" in content
+        assert "output logic irq" in content
 
     def test_layer_idx_comparison(self, generated_rtl: tuple[Path, Graph]) -> None:
         """accelerator_top.sv compares layer_idx to NUM_LAYERS - 1."""

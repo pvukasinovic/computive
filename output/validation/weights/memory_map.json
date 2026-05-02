@@ -1,0 +1,99 @@
+{
+  "weight_bank": {
+    "total_rows": 1536,
+    "row_width_bytes": 128,
+    "total_bytes": 196608
+  },
+  "bias_bank": {
+    "total_rows": 32,
+    "row_width_bytes": 128,
+    "total_bytes": 4096
+  },
+  "total_bytes": 200704,
+  "layers": [
+    {
+      "layer_index": 0,
+      "layer_name": "fused_0",
+      "input_dim": 640,
+      "output_dim": 128,
+      "num_tiles": 1,
+      "parallelism": 128,
+      "weight": {
+        "sram_bank": "WEIGHT_BANK",
+        "start_row": 0,
+        "num_rows": 640,
+        "size_bytes": 81920
+      },
+      "bias": {
+        "sram_bank": "BIAS_BANK",
+        "start_row": 0,
+        "num_rows": 4,
+        "size_bytes": 512
+      },
+      "total_size_bytes": 82432
+    },
+    {
+      "layer_index": 1,
+      "layer_name": "fused_1",
+      "input_dim": 128,
+      "output_dim": 128,
+      "num_tiles": 1,
+      "parallelism": 128,
+      "weight": {
+        "sram_bank": "WEIGHT_BANK",
+        "start_row": 640,
+        "num_rows": 128,
+        "size_bytes": 16384
+      },
+      "bias": {
+        "sram_bank": "BIAS_BANK",
+        "start_row": 4,
+        "num_rows": 4,
+        "size_bytes": 512
+      },
+      "total_size_bytes": 16896
+    },
+    {
+      "layer_index": 2,
+      "layer_name": "fused_2",
+      "input_dim": 128,
+      "output_dim": 128,
+      "num_tiles": 1,
+      "parallelism": 128,
+      "weight": {
+        "sram_bank": "WEIGHT_BANK",
+        "start_row": 768,
+        "num_rows": 128,
+        "size_bytes": 16384
+      },
+      "bias": {
+        "sram_bank": "BIAS_BANK",
+        "start_row": 8,
+        "num_rows": 4,
+        "size_bytes": 512
+      },
+      "total_size_bytes": 16896
+    },
+    {
+      "layer_index": 3,
+      "layer_name": "fused_3",
+      "input_dim": 128,
+      "output_dim": 640,
+      "num_tiles": 5,
+      "parallelism": 128,
+      "weight": {
+        "sram_bank": "WEIGHT_BANK",
+        "start_row": 896,
+        "num_rows": 640,
+        "size_bytes": 81920
+      },
+      "bias": {
+        "sram_bank": "BIAS_BANK",
+        "start_row": 12,
+        "num_rows": 20,
+        "size_bytes": 2560
+      },
+      "total_size_bytes": 84480
+    }
+  ]
+}

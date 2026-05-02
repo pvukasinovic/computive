@@ -1,0 +1,27 @@
+{
+  "num_vectors": 100,
+  "model_name": "ad_model",
+  "input_names": [
+    "input"
+  ],
+  "output_names": [
+    "layer3_add_out"
+  ],
+  "input_shapes": {
+    "input": [
+      1,
+      640
+    ]
+  },
+  "output_shapes": {
+    "layer3_add_out": [
+      1,
+      640
+    ]
+  },
+  "files": {
+    "input_input": "test_inputs_input.npy",
+    "output_layer3_add_out": "golden_outputs_layer3_add_out.npy",
+    "labels": "test_labels.npy"
+  }
+}

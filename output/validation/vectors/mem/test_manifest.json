@@ -1,0 +1,25 @@
+{
+  "num_vectors": 100,
+  "model_name": "ad_model",
+  "input_names": [
+    "input"
+  ],
+  "output_names": [
+    "layer3_add_out"
+  ],
+  "input_shapes": {
+    "input": [
+      1,
+      640
+    ]
+  },
+  "output_shapes": {
+    "layer3_add_out": [
+      1,
+      640
+    ]
+  },
+  "input_file": "test_inputs.mem",
+  "output_file": "golden_outputs.mem",
+  "intermediate_files": []
+}

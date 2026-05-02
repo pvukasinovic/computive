@@ -1,463 +1,314 @@
-# MLASIC
+# Computive
 
-**ML model to ASIC compiler** — transforms frozen ONNX models into synthesizable, model-specific hardware accelerators (SystemVerilog RTL) optimized for power, performance, and area.
+> https://github.com/pvukasinovic/computive
 
-```
-ONNX Model  ──>  Ingestion  ──>  Optimization  ──>  Scheduling  ──>  Weight Packing  ──>  RTL Gen  ──>  Verification
- (.onnx)        (Stage 1)       (Stage 2)          (Stage 3)        (Stage 4)           (Stage 5)     (Stage 6)
-```
+Compile a frozen ONNX model into a model-specific, synthesizable INT8
+accelerator: SystemVerilog RTL, weight images, golden vectors, and
+testbenches. Target is Xilinx Zynq UltraScale+ (Kria KV260) for the v0.1
+flow; an ASIC ROM target is also supported.
 
-## Overview
+Computive is a **real compiler**, not a model-specific code generator:
 
-MLASIC takes a trained ONNX neural network and compiles it into a complete, synthesizable hardware accelerator. The generated RTL includes:
+- **Frontend** parses ONNX into a typed IR (`computive.ingestion`,
+  `computive.ir`).
+- **Mid-end** runs analysis and transformation passes — constant
+  folding, DCE, BatchNorm fold, operator fusion, calibration,
+  quantization (`computive.optimization`).
+- **Backend** lowers the IR into an RTL IR (`RTLModule`, `RTLInstance`,
+  `RTLContinuousAssign`, …) and a dumb emitter walks that IR to print
+  SystemVerilog (`computive.rtl_ir`, `computive.rtl_lowering*`,
+  `computive.rtl_emit`). No templated `.sv` blob with `{var}` slots —
+  instances are built from graph attributes.
+- **Placement** is liveness-driven: activation banks are assigned by an
+  analysis pass over the dataflow graph, and the DAG schedule reorders
+  ready nodes to minimise peak SRAM (`BankAllocator` in
+  `computive.scheduler`, `peak_aware_topological_order` in
+  `computive.dag_scheduler`).
 
-- **Compute modules**: 128-wide INT8 MAC array, requantization, activation functions
-- **Memory system**: SRAM banks with ping-pong buffering for activations, weight/bias storage
-- **Control logic**: Layer FSMs with output tiling for large dimensions
-- **Interfaces**: AXI-Lite control/status registers, AXI-Stream data input/output
-- **Verification**: Golden test vectors, SystemVerilog testbenches, cocotb tests, functional coverage
+> The Python package on disk is still imported as `mlasic` for now — the
+> codebase is being renamed incrementally.
 
-The v0.1 target is the [MLPerf Tiny Anomaly Detection](https://github.com/mlcommons/tiny) model (4-layer dense autoencoder, ~100K parameters, INT8 quantized) on a Xilinx Zynq UltraScale+ (Kria KV260).
+---
 
-### Supported Model Types
-
-| Path | Model Types | Architecture |
-|------|-------------|--------------|
-| **MLP** | Dense/linear autoencoders, classifiers | Shared MAC array, time-multiplexed layers, ping-pong SRAM |
-| **CNN** | Convolutional networks (Conv, Pool, etc.) | Tile fabric with per-tile compute units, static routing |
-| **ASIC** | Large models (100M+ params) | Tile fabric with per-tile hardcoded weight ROM |
-
-The compiler auto-selects the appropriate path based on the model's operator types.
-
-## Quick Start
-
-### Prerequisites
-
-- Python 3.10+
-- pip
-
-### Installation
+## Quick start
 
 ```bash
-git clone <repo-url>
-cd mlasic
-
-# Create virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Install in development mode
-make install
+git clone https://github.com/pvukasinovic/computive.git
+cd computive
+python3 -m venv .venv && source .venv/bin/activate
+make install      # editable install + dev deps (onnx, onnxruntime, pytest, ruff)
+make test         # run the test suite
 ```
 
-This installs the `mlasic` package and its dependencies (`onnx`, `onnxruntime`, `numpy`, `scipy`) plus dev tools (`pytest`, `ruff`).
-
-### Run the Demo Pipeline
-
-The fastest way to see MLASIC in action is the included demo script that compiles 4 models end-to-end:
+Compile a model:
 
 ```bash
-python run_two_models.py
+python -m mlasic compile path/to/model.onnx -o output/my_model
 ```
 
-This compiles:
-
-1. **MLPerf Tiny AD** — 640->128->128->128->640 MLP autoencoder (MLP path)
-2. **Narrow Bottleneck MLP** — 640->128->64->128->640 autoencoder (MLP path)
-3. **Simple CNN** — Conv->BN->ReLU->MaxPool->GlobalAvgPool->Dense (tile fabric path)
-4. **Large MLP** — 369M parameter, 21-layer MLP (ASIC tile fabric path)
-
-Output goes to `output/<model_name>/` with RTL, weights, testbenches, and golden vectors.
-
-### Run Tests
-
-```bash
-make test          # Run all 514+ tests
-make lint          # Check code style (ruff)
-make format        # Auto-fix code style
-make rtl-lint      # Verilator lint on SystemVerilog modules (requires verilator)
-```
-
-## Compiling Your Own Model
-
-### Step 1: Prepare an ONNX Model
-
-Export your trained model to ONNX format. For PyTorch:
+Programmatic equivalent (handy when scripting calibration or
+custom passes):
 
 ```python
-import torch
-import torch.onnx
-
-model = YourModel()
-model.eval()
-dummy_input = torch.randn(1, 640)  # Match your input shape
-torch.onnx.export(model, dummy_input, "my_model.onnx", opset_version=17)
-```
-
-Place the `.onnx` file anywhere accessible. The `models/` directory contains pre-downloaded models for reference (BERT, GPT2, MobileNetV2, ResNet50, etc.).
-
-### Step 2: Run the Compiler Pipeline
-
-```python
-#!/usr/bin/env python3
 from pathlib import Path
 import numpy as np
-
 from mlasic.ingestion import ONNXParser
 from mlasic.optimization import (
-    PassManager,
-    ConstantFoldingPass,
-    DeadCodeEliminationPass,
-    BatchNormFoldingPass,
-    OperatorFusionPass,
-    QuantizationPass,
+    PassManager, ConstantFoldingPass, DeadCodeEliminationPass,
+    BatchNormFoldingPass, OperatorFusionPass, QuantizationPass,
 )
-from mlasic.scheduler import Scheduler, schedule_to_json
+from mlasic.scheduler import Scheduler
 from mlasic.weight_packer import WeightPacker
 from mlasic.rtl_gen import RTLGenerator
-from mlasic.golden_vectors import GoldenVectorGenerator
-from mlasic.testbench_gen import VerifConfig, VerifGenerator
 from mlasic.ir import HardwareConstraints
 
-# ── Configuration ──
-model_path = Path("my_model.onnx")
-output_dir = Path("output/my_model")
-input_shape = (1, 640)  # Your model's input shape
+graph = ONNXParser(Path("model.onnx")).parse()
 
-# ── Stage 1: Parse ONNX ──
-graph = ONNXParser(model_path).parse()
-print(f"Parsed {len(graph.nodes)} nodes, {len(graph.tensors)} tensors")
-
-# ── Stage 2: Optimize & Quantize ──
-# Generate calibration data (representative inputs for quantization)
-rng = np.random.RandomState(42)
-calibration_data = [rng.randn(*input_shape).astype(np.float32) for _ in range(20)]
-
+calib = [np.random.randn(1, 640).astype(np.float32) for _ in range(20)]
 pm = PassManager()
-pm.add_pass(ConstantFoldingPass())
-pm.add_pass(DeadCodeEliminationPass())
-pm.add_pass(BatchNormFoldingPass())
-pm.add_pass(OperatorFusionPass())
-pm.add_pass(QuantizationPass(calibration_data=calibration_data))
+for p in [ConstantFoldingPass(), DeadCodeEliminationPass(),
+          BatchNormFoldingPass(), OperatorFusionPass(),
+          QuantizationPass(calibration_data=calib)]:
+    pm.add_pass(p)
 graph = pm.run(graph, verify=True)
-print(f"Optimized to {len(graph.nodes)} fused nodes")
 
-# ── Stage 3: Schedule ──
 hw = HardwareConstraints()
 schedule = Scheduler(constraints=hw).schedule(graph)
-schedule_to_json(schedule, output_dir / "schedule.json")
-print(f"Scheduled: {schedule.total_cycles} cycles, {schedule.latency_us:.2f} us")
 
-# ── Stage 4: Pack Weights ──
-weight_dir = output_dir / "weights"
-memory_map = WeightPacker(graph, weight_dir, constraints=hw).pack_weights()
-print(f"Packed weights: {memory_map['weight_bank']['total_bytes']:,} bytes")
-
-# ── Stage 5: Generate RTL ──
-rtl_dir = output_dir / "rtl"
-RTLGenerator(
-    graph=graph,
-    weight_dir=weight_dir,
-    output_dir=rtl_dir,
-    constraints=hw,
-).generate_all()
-print(f"Generated {len(list(rtl_dir.rglob('*.sv')))} SystemVerilog files")
-
-# ── Stage 6: Generate Verification ──
-gvg = GoldenVectorGenerator(graph)
-vectors = gvg.generate_random_vectors(n=100, seed=42)
-vec_dir = output_dir / "vectors"
-gvg.export_mem(vectors, vec_dir / "mem")
-gvg.export_npy(vectors, vec_dir / "npy")
-
-tb_dir = output_dir / "testbench"
-config = VerifConfig(graph=graph, output_dir=tb_dir, weight_dir=weight_dir, constraints=hw)
-VerifGenerator(config).generate_all()
-print(f"Generated testbenches in {tb_dir}")
+WeightPacker(graph, Path("out/weights"), constraints=hw).pack_weights()
+RTLGenerator(graph=graph, weight_dir=Path("out/weights"),
+             output_dir=Path("out/rtl"), constraints=hw).generate_all()
 ```
 
-### Step 3: CNN/Transformer Models
+CNN/Transformer flow (`DAGScheduler` + `TileMapper` instead of the
+linear `Scheduler`) is in `validate_compiler.py` and the demo scripts.
 
-For models with Conv, Softmax, LayerNorm, or other non-linear operators, use the DAG pipeline:
+---
 
-```python
-from mlasic.dag_scheduler import DAGScheduler
-from mlasic.tile_mapper import TileMapper
-from mlasic.optimization import (
-    ConvBatchNormFoldingPass,
-    ConvFusionPass,
-    ConvQuantizationPass,
-)
-
-# Stage 2: Use CNN-specific passes
-pm = PassManager()
-pm.add_pass(ConstantFoldingPass())
-pm.add_pass(DeadCodeEliminationPass())
-pm.add_pass(BatchNormFoldingPass())
-pm.add_pass(ConvBatchNormFoldingPass())
-pm.add_pass(DeadCodeEliminationPass())
-pm.add_pass(ConvFusionPass())
-pm.add_pass(OperatorFusionPass())
-pm.add_pass(ConvQuantizationPass(calibration_data=calibration_data))
-pm.add_pass(QuantizationPass(calibration_data=calibration_data))
-graph = pm.run(graph, verify=False)
-
-# Stage 3: DAG scheduling + tile mapping
-dag_schedule = DAGScheduler().schedule(graph)
-fabric = TileMapper().map(graph, dag_schedule)
-
-# Stage 5: RTL with tile fabric
-RTLGenerator(
-    graph=graph,
-    weight_dir=weight_dir,
-    output_dir=rtl_dir,
-    constraints=HardwareConstraints(),
-    fabric_config=fabric,      # Enables tile fabric path
-    target="fpga",             # or "asic" for hardcoded weight ROM
-).generate_all()
-```
-
-## Output Structure
-
-After compilation, each model produces:
+## Repo layout
 
 ```
-output/<model_name>/
-├── <model_name>.onnx           # Original ONNX model
-├── schedule.json               # Timing & SRAM layout
-├── coverage.json               # Functional coverage report
-│
-├── weights/                    # INT8 weights in $readmemh format
-│   ├── weights_layer0.mem      # Per-layer weight memory
-│   ├── biases_layer0.mem       # Per-layer bias memory
-│   ├── weight_bank.mem         # Combined weight SRAM image
-│   ├── bias_bank.mem           # Combined bias SRAM image
-│   └── memory_map.json         # SRAM address map for RTL
-│
-├── rtl/                        # Complete synthesizable RTL
-│   ├── parameters.svh          # Model-specific parameters
-│   ├── accelerator_top.sv      # Top-level module
-│   ├── compute/                # MAC array, requantize, activations
-│   ├── memory/                 # SRAM banks, ping-pong buffer
-│   ├── layer/                  # Layer control FSMs
-│   ├── interface/              # AXI-Lite/Stream interfaces
-│   ├── tile/                   # Tile wrapper & fabric (CNN/ASIC)
-│   └── constraints/            # Xilinx .xdc timing constraints
-│
-├── vectors/                    # Golden test vectors
-│   ├── mem/                    # $readmemh format (for SV testbenches)
-│   │   ├── input_vectors.mem
-│   │   ├── expected_outputs.mem
-│   │   └── test_manifest.json
-│   └── npy/                    # NumPy format (for cocotb)
-│       ├── inputs.npy
-│       ├── outputs.npy
-│       └── manifest.json
-│
-└── testbench/                  # Verification testbenches
-    ├── tb_mac_array.sv         # MAC array unit test
-    ├── tb_requantize.sv        # Requantization unit test
-    ├── tb_activation_relu.sv   # ReLU unit test
-    ├── tb_sram_bank.sv         # SRAM unit test
-    ├── tb_ping_pong_buffer.sv  # Ping-pong unit test
-    ├── tb_fused_linear_relu.sv # Layer FSM unit test
-    ├── tb_axi_stream_in.sv     # AXI-Stream input test
-    ├── tb_axi_stream_out.sv    # AXI-Stream output test
-    ├── tb_axi_lite_ctrl.sv     # AXI-Lite CSR test
-    ├── tb_accelerator.sv       # System-level integration test
-    ├── test_accelerator.py     # cocotb Python test
-    └── Makefile                # cocotb simulation runner
+src/mlasic/                         (package directory; will be renamed to computive)
+  ingestion.py          Stage 1 — ONNX → IR (parser, shape inference)
+  ir.py                 IR types: Graph, OpNode, Tensor, OpType, QuantParams,
+                        HardwareConstraints, LayerSchedule, …
+  optimization.py       Stage 2 — every analysis/transform pass + PassManager
+  interpreter.py        FP32 reference interpreter (correctness oracle)
+  int8_interpreter.py   Bitwise-faithful INT8 interpreter (golden oracle)
+  scheduler.py          Stage 3 — linear MLP schedule + BankAllocator
+  dag_scheduler.py      Stage 3 — DAG schedule, lifetime analysis,
+                        peak-aware reorder, weight streaming
+  tile_mapper.py        Stage 3b — operator → tile placement (CNN/ASIC)
+  rom_mapper.py         Stage 4 — per-tile weight ROM extraction
+  weight_packer.py      Stage 4 — INT8 weight/bias .mem packing
+  rtl_ir.py             RTL IR (RTLModule/Instance/Signal/RawBlock)
+  rtl_emit.py           Dumb structural emitter (zero logic)
+  rtl_lowering.py       Linear-MLP IR → RTL IR lowering
+  rtl_lowering_tile.py  Tile-fabric IR → RTL IR lowering
+  rtl_gen.py            Stage 5 — orchestration, model-path selection
+  golden_vectors.py     Stage 6 — generates input/output vectors
+  testbench_gen.py      Stage 6 — SV + cocotb testbench generation
+  cli.py                CLI entry point
+
+rtl/                    Parameterized SystemVerilog cell library
+  compute/  memory/  layer/  interface/  tile/  top/  constraints/
+
+tests/                  ~520 unit + integration tests
+docs/                   PRD, IR spec, quantization spec, RTL spec, firmware guide
 ```
 
-## Pipeline Stages
+A node added in `optimization.py` should not need changes anywhere
+else in the compiler — every pass walks `graph.topological_order()` and
+dispatches on `node.op_type`. Same goes for adding an op: register it
+in `ir.OpType`, give it an entry in any pass that should see it, and
+add a cycle model in `dag_scheduler.CYCLE_MODEL_REGISTRY`.
 
-### Stage 1: ONNX Ingestion
+---
 
-Parses ONNX protobuf into an internal IR (Intermediate Representation) graph. Supports 40+ ONNX operators across two tiers:
+## Pipeline at a glance
 
-**Tier 1** (MLP): MatMul, Add, ReLU, BatchNormalization, Reshape, Transpose, Flatten
-**Tier 2** (CNN/Transformer): Conv, Gemm, Softmax, LayerNorm, MaxPool, AveragePool, GlobalAveragePool, Sigmoid, Tanh, Concat, Gather, and more
+```
+ONNX ─► Ingestion ─► Optimization ─► Scheduling ─► Weight pack ─► RTL gen ─► Verification
+        Stage 1      Stage 2          Stage 3       Stage 4         Stage 5    Stage 6
+        (parse,      (fold, fuse,    (cycle budget, (INT8 .mem      (RTL IR    (golden
+         shape       quantize)        bank assign,   files,          → SV       vectors,
+         infer)                       tile map)      memory map)     emit)      testbenches)
+```
 
-The parser performs shape inference, extracts operator attributes, and builds a typed tensor graph.
+Each stage attaches its results to the IR (`node.fused_attrs`,
+`node.schedule_info`, `node.dag_schedule`) and bumps `graph.stage` so
+downstream stages can validate their preconditions.
 
-### Stage 2: Graph Optimization
+---
 
-Runs a sequence of optimization and quantization passes:
+## Compiler architecture (the “real compiler” bits)
 
-| Pass | Effect |
-|------|--------|
-| `ConstantFoldingPass` | Evaluates constant subexpressions at compile time |
-| `DeadCodeEliminationPass` | Removes unreachable nodes |
-| `BatchNormFoldingPass` | Folds BatchNorm parameters into preceding MatMul+Add |
-| `ConvBatchNormFoldingPass` | Folds BatchNorm into Conv weights (CNN models) |
-| `OperatorFusionPass` | Fuses MatMul+Add[+ReLU] into FusedLinear[ReLU] |
-| `ConvFusionPass` | Fuses Conv+ReLU/Clip into FusedConvReLU |
-| `ActivationFusionPass` | Fuses GELU and SiLU patterns |
-| `QuantizationPass` | Calibration-based INT8 quantization with requantization parameters |
-| `ConvQuantizationPass` | Per-channel INT8 quantization for Conv operators |
+### Mid-end passes
 
-Each pass can be verified against a floating-point reference interpreter to ensure correctness.
+`computive.optimization` is a sequence of passes registered with
+`PassManager`. Every pass iterates `graph.topological_order()` and
+dispatches by `node.op_type`; nothing assumes a specific layer count or
+shape. Examples:
 
-### Stage 3: Dataflow Scheduling
+| Pass | What it does |
+|---|---|
+| `ConstantFoldingPass` | Fixed-point folding over 17+ ops (MatMul, Reshape, Slice, Concat, …) |
+| `DeadCodeEliminationPass` | Backward reachability from `graph.outputs` |
+| `BatchNormFoldingPass` | Pattern-match MatMul→Add→BN, fold params; same generically for Conv→BN |
+| `OperatorFusionPass` | MatMul→Add[→ReLU] → `FusedLinear[ReLU]` via single-consumer check |
+| `QuantizationPass` | Calibration over node activations; per-channel weight scales |
 
-Two scheduling modes:
+Adding a new pass: subclass `Pass`, implement `run(graph) -> Graph`,
+register with `PassManager`. Run the `validate_ir` skill (or
+`computive.ir.verify_invariants`) after each pass during development.
 
-- **Linear Scheduler** (`Scheduler`): For pure MLP models. Assigns cycle budgets, SRAM addresses, and ping-pong buffer banks per layer. Formula: `cycles_per_tile = input_dim + 149`.
-- **DAG Scheduler** (`DAGScheduler`): For arbitrary graphs (CNN, Transformer). Per-operator cycle models, activation lifetime analysis, multi-activation SRAM budget planning. Plus **tile mapping** (`TileMapper`) for spatial assignment.
+### RTL backend
 
-### Stage 4: Weight Packing
+`computive.rtl_ir` defines a structural IR for SystemVerilog:
+`RTLModule`, `RTLInstance`, `RTLSignal`, `RTLContinuousAssign`,
+`RTLRawBlock`. The emitter (`rtl_emit.py`) is deliberately dumb — it
+only formats. All lowering decisions live in `rtl_lowering*.py`, which
+walks the compute graph, extracts attributes, and builds `RTLInstance`s
+dynamically.
 
-Quantized INT8 weights and INT32 biases are packed into `$readmemh`-compatible `.mem` files matching the RTL SRAM access pattern:
+Behavioural blobs (top-level FSM, AXI handshake bodies) are wrapped in
+`RTLRawBlock` with explicit `defines`/`uses` so liveness analysis still
+sees them — analogous to LLVM inline-asm. They are the boundary, not
+the rule.
 
-- 1024-bit wide rows (128 bytes per row for weights, 32 INT32 biases per row)
-- Per-layer files + combined bank files
-- `memory_map.json` with SRAM addresses for RTL parameterization
+To add a new RTL primitive:
 
-For CNN/ASIC targets, `WeightROMMapper` generates per-tile ROM binary images.
+1. Drop the parameterized `.sv` cell into `rtl/<group>/`.
+2. In the lowering pass, build an `RTLInstance(module_type="my_cell", …)`
+   from the IR node’s attributes.
+3. Reference its ports/params in surrounding `add_signal` /
+   `add_continuous_assign` calls.
 
-### Stage 5: RTL Generation
+Nothing about the new cell touches the emitter or other modules.
 
-Generates a complete, synthesizable SystemVerilog design:
+### RTL formatting conventions
 
-- **`parameters.svh`**: Model-specific localparam arrays (dimensions, SRAM addresses, requantization parameters)
-- **`accelerator_top.sv`**: Top-level module instantiating all submodules
-- **Module library**: MAC array, requantize, activation, SRAM, ping-pong buffer, layer FSM, AXI interfaces
-- **Tile fabric** (CNN/ASIC): Per-tile compute units with static inter-tile routing
+- **Inputs use the implicit wire type** — `input clk`, not
+  `input logic clk`. Outputs/inouts keep `logic` because the body
+  drives them procedurally.
+- **Single-space port decls** — no column alignment with multiple
+  spaces.
+- **Sized fill literals** — `{ACC_W{1'b0}}` or `7'b0`, never `'0`. The
+  width is always explicit so the synthesiser cannot silently extend
+  or truncate.
 
-Supports dual targets:
-- **FPGA**: `sram_bank.sv` with `$readmemh` weight loading
-- **ASIC**: `rom_tile.sv` with hardcoded `initial` blocks for weight ROM
+The emitter follows these rules in code; running the compiler is the
+only sanctioned way to regenerate `accelerator_top.sv` and friends.
 
-### Stage 6: Verification
+### Placement & scheduling
 
-Generates everything needed to verify the hardware:
+The scheduler is **not** a fixed “layer 0 = bank A, layer 1 = bank B”
+rule. Two model-driven decisions:
 
-- **Golden vectors**: 100+ random + adversarial + rounding-boundary test vectors generated by an INT8 interpreter that matches hardware arithmetic bitwise
-- **9 module-level SystemVerilog testbenches**: One per RTL module
-- **System-level testbench**: Full accelerator with AXI drivers and per-vector comparison
-- **cocotb Python test**: AXI-Lite/Stream drivers with golden vector checking
-- **Functional coverage**: 11 coverage items tracking layer execution, SRAM access, tiling, interrupts, etc.
+- **`BankAllocator`** (`scheduler.py`). Two physical activation banks
+  (A, B). For each layer in topo order:
+  1. Find the bank holding the layer’s activation input.
+  2. Decrement that tensor’s remaining-use counter; free the bank if
+     it falls to zero.
+  3. Pick a free bank for the output, preferring the bank not used by
+     the input (so reads and writes use disjoint SRAMs). If both banks
+     hold live tensors, raise `BankConflict` rather than silently
+     overwriting one.
 
-## Architecture Details
+  For a strict linear MLP this collapses to A/B/A/B alternation
+  (preserving the hardware ping-pong invariant). For a graph that
+  would clobber a still-live tensor, the compiler refuses instead of
+  producing wrong RTL. See `tests/test_placement.py`.
 
-### INT8 Quantization
+- **`peak_aware_topological_order`** (`dag_scheduler.py`). Among nodes
+  whose in-degree just hit zero, pick the one with the smallest
+  `output_bytes − freed_input_bytes`. This is a Sethi–Ullman-style
+  greedy and is the default for `DAGScheduler`. On a strict chain it
+  is identical to Kahn’s order; on a branchy graph it lowers peak
+  activation SRAM. Disable with `DAGScheduler(peak_aware_order=False)`.
 
-| Component | Strategy |
-|-----------|----------|
-| Weights | Symmetric: zero_point=0, range [-127, 127] |
-| Activations | Asymmetric: variable zero_point, range [-128, 127] |
-| Accumulation | INT32 (prevents overflow) |
-| Requantization | Fixed-point 16.16 multiplier, round-half-up (`floor(x + 0.5)`) |
+`ActivationLifetimeAnalyzer` and `SRAMBudgetPlanner` in
+`dag_scheduler.py` consume the resulting order to produce the
+budget report.
 
-The round-half-up rounding mode is critical — it matches hardware behavior. Python's `np.round()` uses banker's rounding, which would cause bitwise mismatches.
+---
 
-### Hardware Target (v0.1)
+## Tests
 
-| Parameter | Value |
-|-----------|-------|
-| FPGA | Xilinx Zynq UltraScale+ (xck26-sfvc784-2LV) |
+```bash
+make test                                              # full suite
+python -m pytest tests/test_placement.py -v            # bank allocator + reorder
+python -m pytest tests/test_dag_scheduler.py -v        # DAG path
+python -m pytest tests/test_rtl_gen.py -v              # RTL lowering
+make rtl-lint                                          # Verilator lint on cell library
+```
+
+Conftest fixtures (`tests/conftest.py`) build the AD model, a CNN, a
+transformer, and a residual block on demand — most stage tests reuse
+those.
+
+The full suite includes a few real-model integration tests
+(`test_real_models.py`, `test_tinyml_models.py`, `test_large_models.py`)
+that load larger ONNX files and can take a minute or more. Skip them
+locally with `-k "not real_models and not tinyml and not large_models"`
+if you only care about unit-level changes.
+
+---
+
+## Generated output (per model)
+
+```
+output/<name>/
+  schedule.json                     timing + SRAM layout
+  weights/                          INT8 .mem files + memory_map.json
+  rtl/
+    parameters.svh                  per-model localparams
+    accelerator_top.sv              top module
+    compute/ memory/ layer/ interface/ tile/ constraints/
+  vectors/
+    mem/  (for SV)                  $readmemh inputs/expected outputs
+    npy/  (for cocotb)              .npy + manifest
+  testbench/
+    tb_*.sv                         per-module SV testbenches
+    test_accelerator.py             cocotb system test
+    Makefile                        cocotb runner
+  coverage.json                     functional coverage report
+```
+
+---
+
+## Hardware target (v0.1)
+
+| | |
+|---|---|
+| Device | Xilinx Zynq UltraScale+ `xck26-sfvc784-2LV` (Kria KV260) |
 | Clock | 100 MHz |
-| MAC Parallelism | 128 INT8 MACs |
-| SRAM Budget | ~197 KB (fits KV260 BRAM) |
-| Control Interface | AXI-Lite (base 0x4000_0000) |
-| Data Interface | AXI-Stream, 64-bit, 80 beats per input |
-| PPA Targets | <0.05 ms latency, >20K inf/sec, <15% LUT, <40% BRAM |
+| MAC array | 128 INT8 MACs, INT32 accumulators |
+| Activation SRAM | 2 banks × 640 B (ping-pong) |
+| Weight SRAM | 1536 rows × 128 B |
+| Bias SRAM | 32 rows × 32×INT32 |
+| Control / data | AXI-Lite @ 0x4000_0000, AXI-Stream 64-bit |
+| Quantization | Symmetric INT8 weights, asymmetric INT8 acts, fixed-point 16.16 requant, round-half-up |
+| PPA targets | <0.05 ms latency, >20K inf/sec, <15 % LUT, <40 % BRAM |
 
-### SystemVerilog Module Library
+Round-half-up (`floor(x + 0.5)`) is mandatory in any quantization path
+— `np.round()` uses banker’s rounding and produces bitwise mismatches
+against the hardware. `int8_interpreter.py` is the canonical reference;
+golden vectors are derived from it.
 
-```
-rtl/
-├── compute/
-│   ├── mac_array.sv           # 128 parallel MACs + FSM
-│   ├── requantize.sv          # INT32->INT8 pipeline (3 stages)
-│   ├── activation_relu.sv     # Combinational INT8 ReLU
-│   ├── conv_engine.sv         # im2col + MAC array reuse
-│   ├── softmax_unit.sv        # 3-stage pipeline with exp LUT
-│   ├── layer_norm_unit.sv     # 2-pass normalize with rsqrt LUT
-│   ├── activation_unit.sv     # ReLU/ReLU6/GELU/SiLU (parameterized)
-│   └── pool_unit.sv           # Max/Avg/GlobalAvg pooling
-├── memory/
-│   ├── sram_bank.sv           # Behavioral SRAM, $readmemh init
-│   ├── ping_pong_buffer.sv    # Double-buffered activation memory
-│   └── rom_tile.sv            # ASIC ROM template
-├── layer/
-│   ├── fused_linear_relu.sv   # Layer control FSM with output tiling
-│   ├── byte_select.sv         # 64-bit -> 8-bit byte mux
-│   └── bias_unpack.sv         # 1024-bit -> 32-bit unpacker
-├── interface/
-│   ├── axi_stream_in.sv       # AXI-Stream slave
-│   ├── axi_stream_out.sv      # AXI-Stream master
-│   └── axi_lite_ctrl.sv       # CSR register file (10 registers)
-├── tile/
-│   ├── tile.sv                # Generic tile wrapper
-│   └── tile_fabric.sv         # Generated fabric template
-├── top/
-│   └── accelerator_top.sv     # Model-specific top module
-└── constraints/
-    └── constraints.xdc        # Xilinx timing constraints
-```
+---
 
-## Project Structure
+## Specs
 
-```
-mlasic/
-├── src/mlasic/                 # Python compiler package
-│   ├── __init__.py             # Public API (155 exports)
-│   ├── ir.py                   # IR data structures (Graph, OpNode, Tensor, QuantParams, ...)
-│   ├── exceptions.py           # Custom exceptions
-│   ├── ingestion.py            # Stage 1: ONNX parser
-│   ├── optimization.py         # Stage 2: Optimization passes
-│   ├── interpreter.py          # FP32 reference interpreter
-│   ├── int8_interpreter.py     # Hardware-exact INT8 interpreter
-│   ├── scheduler.py            # Stage 3: Linear MLP scheduler
-│   ├── dag_scheduler.py        # Stage 3: DAG scheduler (CNN/Transformer)
-│   ├── tile_mapper.py          # Stage 3b: Spatial tile mapping
-│   ├── rom_mapper.py           # Stage 4: Per-tile ROM generation
-│   ├── weight_packer.py        # Stage 4: Weight/bias .mem packing
-│   ├── rtl_gen.py              # Stage 5: SystemVerilog generation
-│   ├── golden_vectors.py       # Stage 6: Golden test vector generation
-│   ├── testbench_gen.py        # Stage 6: Testbench generation
-│   └── export.py               # IR-to-ONNX exporter (round-trip testing)
-│
-├── rtl/                        # SystemVerilog module library
-├── tests/                      # 514+ tests across 19 test files
-├── models/                     # Pre-downloaded ONNX models
-├── output/                     # Generated output (per-model directories)
-├── docs/                       # Specifications
-│   ├── PRD.md                  # Product requirements
-│   ├── compiler-ir-spec.md     # IR specification & invariants
-│   ├── quantization-spec.md    # INT8 quantization specification
-│   ├── rtl-interface-spec.md   # SystemVerilog module specifications
-│   └── firmware-integration-guide.md  # Zynq driver & DMA guide
-│
-├── pyproject.toml              # Package metadata & dependencies
-├── Makefile                    # Build/test/lint commands
-├── run_two_models.py           # End-to-end demo (4 models)
-└── STATUS.md                   # Development progress tracking
-```
+| File | Contents |
+|---|---|
+| [`docs/PRD.md`](docs/PRD.md) | Product requirements, milestones, PPA targets |
+| [`docs/compiler-ir-spec.md`](docs/compiler-ir-spec.md) | IR data structures, supported ops, invariants |
+| [`docs/quantization-spec.md`](docs/quantization-spec.md) | INT8 math, requantization, rounding |
+| [`docs/rtl-interface-spec.md`](docs/rtl-interface-spec.md) | SystemVerilog modules, AXI, memory map, FSM timing |
+| [`docs/firmware-integration-guide.md`](docs/firmware-integration-guide.md) | Zynq driver API, DMA, register map |
 
-## Makefile Commands
-
-| Command | Description |
-|---------|-------------|
-| `make install` | Install package in editable mode with dev dependencies |
-| `make test` | Run all tests with pytest |
-| `make lint` | Check code style with ruff |
-| `make format` | Auto-fix code style |
-| `make rtl-lint` | Verilator lint on SystemVerilog modules |
-| `make clean` | Remove build artifacts |
-
-## Specifications
-
-Detailed design specifications live in `docs/`:
-
-| Document | Contents |
-|----------|----------|
-| [PRD](docs/PRD.md) | Product requirements, milestones, success criteria, PPA targets |
-| [Compiler IR Spec](docs/compiler-ir-spec.md) | IR data structures, supported operators, invariants (INV-1.1 through INV-4.6) |
-| [Quantization Spec](docs/quantization-spec.md) | INT8 symmetric/asymmetric quantization, INT32 accumulation, fixed-point requantization |
-| [RTL Interface Spec](docs/rtl-interface-spec.md) | SystemVerilog module specs, AXI interfaces, memory map, FSM timing |
-| [Firmware Guide](docs/firmware-integration-guide.md) | Zynq ARM driver API, DMA setup, register map, interrupt handling |
+---
 
 ## License
 
